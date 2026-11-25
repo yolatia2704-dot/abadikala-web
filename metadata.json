@@ -1,0 +1,6 @@
+{
+  "name": "Sekar Karsa — Studio Bunga & Botani Yogyakarta",
+  "description": "Studio rangkaian bunga segar musiman, bunga kering lokal, dan meja rangkai virtual di Prawirotaman, Yogyakarta.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
