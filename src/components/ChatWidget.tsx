@@ -60,6 +60,25 @@ function loadInitialWebhookUrl(): string {
   }
 }
 
+function extractReplyText(payload: unknown): string | null {
+  const target = Array.isArray(payload) ? payload[0] : payload;
+
+  if (typeof target === 'string') {
+    const trimmed = target.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (target && typeof target === 'object') {
+    const data = target as Record<string, unknown>;
+    const candidate = data.reply || data.output || data.message;
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
 export function ChatWidget(_props: ChatWidgetProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [showWebhookPanel, setShowWebhookPanel] = useState(false);
@@ -110,14 +129,8 @@ export function ChatWidget(_props: ChatWidgetProps) {
 
     try {
       const parsed = new URL(trimmed);
-      if (parsed.protocol !== 'https:') {
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
         setWebhookError('Gunakan URL webhook n8n berawalan https://.');
-        return;
-      }
-      if (!/\/webhook(-test)?(\/|$)/i.test(parsed.pathname)) {
-        setWebhookError(
-          'Pastikan tautan mengandung jalur /webhook/ atau /webhook-test/ dari n8n.',
-        );
         return;
       }
     } catch {
@@ -153,7 +166,8 @@ export function ChatWidget(_props: ChatWidgetProps) {
     const trimmed = textToSend.trim();
     if (!trimmed || isSending) return;
 
-    const history = messages
+    const targetUrl = webhookUrl.trim() || DEFAULT_WEBHOOK_URL;
+    const recentMessages = messages
       .filter((m) => !m.isError)
       .slice(-4)
       .map((m) => ({
@@ -173,41 +187,29 @@ export function ChatWidget(_props: ChatWidgetProps) {
     setIsSending(true);
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch(targetUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           message: trimmed,
-          history,
-          webhookUrl: webhookUrl.trim(),
+          history: recentMessages,
         }),
       });
 
       const rawResponseText = await response.text();
-      let data: {
-        reply?: string;
-        output?: string;
-        message?: string;
-        error?: string;
-        httpStatus?: number;
-      } = {};
-
-      try {
-        data = JSON.parse(rawResponseText) as typeof data;
-      } catch {
-        data = {};
-      }
 
       if (!response.ok) {
-        const statusCode = data.httpStatus ?? response.status;
+        const snippet = rawResponseText.trim().slice(0, 160);
         setMessages((prev) => [
           ...prev,
           {
             id: `err-${Date.now()}`,
             role: 'assistant',
-            text:
-              data.error ||
-              `Gagal menghubungi webhook n8n (HTTP ${statusCode}). Periksa URL webhook atau pastikan workflow n8n aktif.`,
+            text: `Gagal menghubungi webhook n8n (HTTP ${response.status})${
+              snippet ? `: ${snippet}` : '.'
+            }`,
             time: getTimeLabel(),
             isError: true,
           },
@@ -215,14 +217,21 @@ export function ChatWidget(_props: ChatWidgetProps) {
         return;
       }
 
-      const botReply = data.reply || data.output || data.message;
+      let parsed: unknown = rawResponseText;
+      try {
+        parsed = JSON.parse(rawResponseText) as unknown;
+      } catch {
+        // Keep raw plain text if n8n returned text/plain
+      }
+
+      const botReply = extractReplyText(parsed);
       if (!botReply) {
         setMessages((prev) => [
           ...prev,
           {
             id: `err-${Date.now()}`,
             role: 'assistant',
-            text: `Respons webhook n8n tidak berisi teks balasan (HTTP ${response.status}). Pastikan node Respond to Webhook mengembalikan field reply, output, atau message.`,
+            text: `Respons webhook n8n tidak berisi teks balasan (HTTP ${response.status}). Pastikan respons mengembalikan properti reply, output, atau message.`,
             time: getTimeLabel(),
             isError: true,
           },
@@ -247,7 +256,7 @@ export function ChatWidget(_props: ChatWidgetProps) {
         {
           id: `err-${Date.now()}`,
           role: 'assistant',
-          text: `Koneksi ke endpoint obrolan gagal (HTTP 0 / Network Error)${detail}. Silakan periksa jaringan Anda dan coba kembali.`,
+          text: `Gagal terhubung ke webhook n8n${detail}. Pastikan workflow n8n aktif dan Allowed Origins (CORS) pada node Webhook mengizinkan domain website ini.`,
           time: getTimeLabel(),
           isError: true,
         },
@@ -375,8 +384,8 @@ export function ChatWidget(_props: ChatWidgetProps) {
 
               <div className="flex items-center justify-between gap-2 pt-1">
                 <p className="text-[10px] text-[#6E655F] leading-snug">
-                  Payload: <code className="text-[#2B2625]">message</code> &amp;{' '}
-                  <code className="text-[#2B2625]">history</code> (4 pesan terakhir).
+                  Direct POST ke n8n · <code className="text-[#2B2625]">message</code>{' '}
+                  &amp; <code className="text-[#2B2625]">history</code>.
                 </p>
                 <button
                   type="submit"
