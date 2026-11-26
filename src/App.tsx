@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { CatalogSection } from './components/CatalogSection';
+import { ChatWidget } from './components/ChatWidget';
 import { FlowerBarSection } from './components/FlowerBarSection';
 import { HeroSection } from './components/HeroSection';
 import { Navbar } from './components/Navbar';
@@ -117,6 +118,8 @@ export default function App() {
         onUpdateQuantity={handleUpdateQuantity}
         onRemoveItem={handleRemoveItem}
       />
+
+      <ChatWidget activeLine={activeLine} orderItems={orderItems} />
     </div>
   );
 }
