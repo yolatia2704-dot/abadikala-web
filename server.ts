@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
+import dns from 'node:dns/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,183 +10,156 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
-const REQUEST_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = 25000;
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_HISTORY_ITEMS = 4;
 
-interface ChatContextPayload {
-  activeLine?: string;
-  cartItemCount?: number;
-  cartSummary?: string[];
+export const DEFAULT_N8N_WEBHOOK_URL =
+  'https://n8n-n8n.fei69c.easypanel.host/webhook/abadikala-chat';
+
+interface HistoryItem {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
-function isPrivateOrBlockedHost(hostname: string): boolean {
+function isPrivateIpAddress(ip: string): boolean {
+  const normalized = ip.toLowerCase().replace(/^::ffff:/, '');
+  const version = net.isIP(normalized);
+
+  if (version === 4) {
+    const parts = normalized.split('.').map(Number);
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
+    const [a, b] = parts;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+    if (a === 169 && b === 254) return true; // Link-local / cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a >= 224) return true; // Multicast / reserved
+    return false;
+  }
+
+  if (version === 6) {
+    if (
+      normalized === '::' ||
+      normalized === '::1' ||
+      normalized.startsWith('fe80:') ||
+      normalized.startsWith('fc') ||
+      normalized.startsWith('fd') ||
+      normalized.startsWith('ff')
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+function isBlockedHostname(hostname: string): boolean {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (
+    !lower ||
     lower === 'localhost' ||
     lower === '0.0.0.0' ||
     lower === '::1' ||
     lower.endsWith('.local') ||
-    lower.endsWith('.internal')
+    lower.endsWith('.internal') ||
+    lower.endsWith('.localhost')
   ) {
     return true;
   }
 
-  const ipVersion = net.isIP(lower);
-  if (ipVersion === 4) {
-    const parts = lower.split('.').map(Number);
-    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
-    const [a, b] = parts;
-    if (a === 10) return true; // 10.0.0.0/8
-    if (a === 127) return true; // 127.0.0.0/8
-    if (a === 169 && b === 254) return true; // 169.254.0.0/16 metadata / link-local
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16
-    if (a === 0) return true;
-  }
-
-  if (ipVersion === 6) {
-    if (
-      lower === '::1' ||
-      lower.startsWith('fe80:') ||
-      lower.startsWith('fc') ||
-      lower.startsWith('fd')
-    ) {
-      return true;
-    }
+  if (net.isIP(lower) !== 0) {
+    return isPrivateIpAddress(lower);
   }
 
   return false;
 }
 
-function getValidatedWebhookUrl(): URL | null {
-  const raw = process.env.N8N_WEBHOOK_URL?.trim();
-  if (!raw) return null;
+async function resolveAndValidateWebhookUrl(
+  rawUrl: string | undefined,
+): Promise<URL | null> {
+  const trimmed = rawUrl?.trim();
+  if (!trimmed) return null;
 
+  let parsed: URL;
   try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-      return null;
-    }
-    if (isPrivateOrBlockedHost(parsed.hostname)) {
-      return null;
-    }
-    return parsed;
+    parsed = new URL(trimmed);
   } catch {
     return null;
   }
-}
 
-function extractReplyFromN8nPayload(payload: unknown): string | null {
-  if (typeof payload === 'string') {
-    const trimmed = payload.trim();
-    return trimmed.length > 0 ? trimmed : null;
-  }
-
-  if (Array.isArray(payload)) {
-    for (const entry of payload) {
-      const extracted = extractReplyFromN8nPayload(entry);
-      if (extracted) return extracted;
-    }
+  if (parsed.protocol !== 'https:') {
     return null;
   }
 
-  if (payload && typeof payload === 'object') {
-    const record = payload as Record<string, unknown>;
-    const candidateKeys = [
-      'output',
-      'reply',
-      'text',
-      'response',
-      'message',
-      'answer',
-      'content',
-    ];
-    for (const key of candidateKeys) {
-      const value = record[key];
-      if (typeof value === 'string' && value.trim().length > 0) {
-        return value.trim();
+  if (parsed.username || parsed.password) {
+    return null;
+  }
+
+  if (isBlockedHostname(parsed.hostname)) {
+    return null;
+  }
+
+  if (!/\/webhook(-test)?(\/|$)/i.test(parsed.pathname)) {
+    return null;
+  }
+
+  try {
+    const records = await dns.lookup(parsed.hostname, { all: true });
+    if (records.length === 0) return null;
+    for (const record of records) {
+      if (isPrivateIpAddress(record.address)) {
+        return null;
       }
     }
-    if (record.data) {
-      return extractReplyFromN8nPayload(record.data);
+  } catch {
+    return null;
+  }
+
+  return parsed;
+}
+
+function sanitizeHistory(raw: unknown): HistoryItem[] {
+  if (!Array.isArray(raw)) return [];
+  const cleaned: HistoryItem[] = [];
+
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    const role = record.role;
+    const content =
+      typeof record.content === 'string' ? record.content.trim() : '';
+
+    if ((role === 'user' || role === 'assistant') && content.length > 0) {
+      cleaned.push({
+        role,
+        content: content.slice(0, MAX_MESSAGE_LENGTH),
+      });
+    }
+  }
+
+  return cleaned.slice(-MAX_HISTORY_ITEMS);
+}
+
+function extractN8nReply(payload: unknown): string | null {
+  const target = Array.isArray(payload) ? payload[0] : payload;
+
+  if (typeof target === 'string') {
+    const trimmed = target.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (target && typeof target === 'object') {
+    const data = target as Record<string, unknown>;
+    const reply = data.reply || data.output || data.message;
+    if (typeof reply === 'string' && reply.trim().length > 0) {
+      return reply.trim();
     }
   }
 
   return null;
-}
-
-function buildLocalStudioReply(message: string): string {
-  const lower = message.toLowerCase();
-
-  if (
-    lower.includes('preservasi') ||
-    lower.includes('shadow') ||
-    lower.includes('awet') ||
-    lower.includes('resin') ||
-    lower.includes('pressed')
-  ) {
-    return (
-      'Untuk Lini Abadi, kami menyediakan Bingkai Shadow-Box 3D Kayu Alami (Rp 485.000), Bingkai Pressed Flower (Rp 320.000), Set Resin Botani (Rp 210.000), serta Jasa Preservasi Buket Anda (Rp 425.000). ' +
-      'Jika ingin mengawetkan buket acara, silakan antar buket ke studio Lhokseumawe maksimal 48 jam setelah acara agar warna kelopak tetap terjaga.'
-    );
-  }
-
-  if (
-    lower.includes('segar') ||
-    lower.includes('buket') ||
-    lower.includes('berastagi') ||
-    lower.includes('takengon') ||
-    lower.includes('harga') ||
-    lower.includes('rekomendasi')
-  ) {
-    return (
-      'Stok Lini Segar kami dipasok dari dataran tinggi Berastagi & Takengon dengan penyimpanan chiller 4–6°C. ' +
-      'Pilihan terfavorit saat ini: Buket Saku Harian Takengon (Rp 135.000), Buket Korean Wrap Mawar Berastagi (Rp 265.000), dan Buket Editorial Marun (Rp 365.000). ' +
-      'Anda juga dapat menyusun sendiri komposisinya di bagian Virtual Flower Bar.'
-    );
-  }
-
-  if (
-    lower.includes('lokasi') ||
-    lower.includes('alamat') ||
-    lower.includes('ongkir') ||
-    lower.includes('kirim') ||
-    lower.includes('buka') ||
-    lower.includes('jam')
-  ) {
-    return (
-      'Studio Abadikala berlokasi di Jl. Merdeka Barat No. 24, Simpang Empat, Banda Sakti, Kota Lhokseumawe, Aceh (buka setiap hari 09.00–20.00 WIB). ' +
-      'Pengantaran Lini Segar menjangkau Banda Sakti, Muara Dua, Blang Mangat, Muara Satu, Krueng Geukueh, hingga Lhoksukon—pesanan hari yang sama ditutup pukul 16.00 WIB.'
-    );
-  }
-
-  return (
-    'Terima kasih telah menghubungi Abadikala Lhokseumawe. Saya dapat membantu informasi mengenai buket Lini Segar (Berastagi & Takengon), Lini Abadi (Shadow-Box, Pressed Flower, Resin), jadwal pengiriman Lhokseumawe, atau layanan preservasi buket. ' +
-    'Silakan tanyakan detail kebutuhan Anda, atau kirim ringkasan pesanan langsung melalui tombol WhatsApp.'
-  );
-}
-
-function sanitizeContext(raw: unknown): ChatContextPayload {
-  if (!raw || typeof raw !== 'object') return {};
-  const obj = raw as Record<string, unknown>;
-  const activeLine =
-    obj.activeLine === 'segar' || obj.activeLine === 'abadi'
-      ? obj.activeLine
-      : undefined;
-  const cartItemCount =
-    typeof obj.cartItemCount === 'number' &&
-    Number.isFinite(obj.cartItemCount) &&
-    obj.cartItemCount >= 0
-      ? Math.min(Math.floor(obj.cartItemCount), 99)
-      : 0;
-  const cartSummary = Array.isArray(obj.cartSummary)
-    ? obj.cartSummary
-        .filter((item): item is string => typeof item === 'string')
-        .slice(0, 10)
-        .map((item) => item.slice(0, 120))
-    : [];
-
-  return { activeLine, cartItemCount, cartSummary };
 }
 
 async function startServer() {
@@ -193,42 +167,49 @@ async function startServer() {
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/api/chat/status', (_req: Request, res: Response) => {
-    const webhookUrl = getValidatedWebhookUrl();
+    const defaultUrl =
+      process.env.N8N_WEBHOOK_URL?.trim() || DEFAULT_N8N_WEBHOOK_URL;
     res.json({
-      connected: webhookUrl !== null,
+      defaultWebhookUrl: defaultUrl,
+      connected: Boolean(defaultUrl),
     });
   });
 
   app.post('/api/chat', async (req: Request, res: Response) => {
     const body = req.body as Record<string, unknown> | undefined;
-    const rawMessage = typeof body?.message === 'string' ? body.message.trim() : '';
-    const rawSessionId =
-      typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+    const rawMessage =
+      typeof body?.message === 'string' ? body.message.trim() : '';
+    const clientWebhookUrl =
+      typeof body?.webhookUrl === 'string' ? body.webhookUrl.trim() : '';
 
     if (!rawMessage) {
-      res.status(400).json({ error: 'Pesan tidak boleh kosong.' });
+      res.status(400).json({
+        error: 'Pesan tidak boleh kosong.',
+        httpStatus: 400,
+      });
       return;
     }
 
     if (rawMessage.length > MAX_MESSAGE_LENGTH) {
       res.status(400).json({
         error: `Pesan terlalu panjang (maksimal ${MAX_MESSAGE_LENGTH} karakter).`,
+        httpStatus: 400,
       });
       return;
     }
 
-    const sessionId = /^[a-zA-Z0-9_-]{8,64}$/.test(rawSessionId)
-      ? rawSessionId
-      : `web_${Date.now()}`;
+    const history = sanitizeHistory(body?.history);
+    const chosenUrl =
+      clientWebhookUrl ||
+      process.env.N8N_WEBHOOK_URL?.trim() ||
+      DEFAULT_N8N_WEBHOOK_URL;
 
-    const context = sanitizeContext(body?.context);
-    const webhookUrl = getValidatedWebhookUrl();
-
-    if (!webhookUrl) {
-      res.json({
-        reply: buildLocalStudioReply(rawMessage),
-        mode: 'local-fallback',
-        connected: false,
+    const targetWebhookUrl = await resolveAndValidateWebhookUrl(chosenUrl);
+    if (!targetWebhookUrl) {
+      res.status(400).json({
+        error:
+          'URL webhook tidak valid. Pastikan menggunakan URL HTTPS publik n8n dengan jalur /webhook/ atau /webhook-test/.',
+        httpStatus: 400,
       });
       return;
     }
@@ -237,70 +218,61 @@ async function startServer() {
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/plain',
-      };
-
-      const webhookSecret = process.env.N8N_WEBHOOK_SECRET?.trim();
-      if (webhookSecret) {
-        if (process.env.N8N_WEBHOOK_AUTH_MODE?.toLowerCase() === 'bearer') {
-          headers.Authorization = `Bearer ${webhookSecret}`;
-        } else {
-          headers['X-Webhook-Secret'] = webhookSecret;
-        }
-      }
-
-      const upstreamRes = await fetch(webhookUrl.toString(), {
+      const upstreamRes = await fetch(targetWebhookUrl.toString(), {
         method: 'POST',
-        headers,
+        redirect: 'error',
+        headers: {
+          'Content-Type': 'application/json',
+        },
         signal: controller.signal,
         body: JSON.stringify({
-          chatInput: rawMessage,
           message: rawMessage,
-          sessionId,
-          source: 'abadikala-web',
-          timestamp: new Date().toISOString(),
-          context,
+          history,
         }),
       });
 
-      const contentType = upstreamRes.headers.get('content-type') || '';
       const rawText = await upstreamRes.text();
 
       if (!upstreamRes.ok) {
-        res.status(502).json({
-          error:
-            'Webhook n8n sedang tidak dapat dihubungi. Silakan coba beberapa saat lagi atau hubungi via WhatsApp.',
+        const shortSnippet = rawText.trim().slice(0, 180);
+        res.status(upstreamRes.status).json({
+          error: `Webhook n8n merespons gagal (HTTP ${upstreamRes.status})${
+            shortSnippet ? `: ${shortSnippet}` : '.'
+          }`,
+          httpStatus: upstreamRes.status,
         });
         return;
       }
 
-      let reply: string | null = null;
-      if (contentType.includes('application/json')) {
-        try {
-          const parsed = JSON.parse(rawText) as unknown;
-          reply = extractReplyFromN8nPayload(parsed);
-        } catch {
-          reply = rawText.trim() || null;
-        }
-      } else {
-        reply = rawText.trim() || null;
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(rawText) as unknown;
+      } catch {
+        parsed = rawText;
+      }
+
+      const reply = extractN8nReply(parsed);
+      if (!reply) {
+        res.status(502).json({
+          error:
+            'Respons dari webhook n8n kosong atau tidak memiliki properti reply, output, maupun message (HTTP 502).',
+          httpStatus: 502,
+        });
+        return;
       }
 
       res.json({
-        reply:
-          reply ||
-          'Pesan Anda telah diterima oleh sistem Abadikala. Tim studio kami akan segera menindaklanjuti.',
-        mode: 'n8n',
-        connected: true,
+        reply,
+        httpStatus: upstreamRes.status,
       });
     } catch (err) {
       const isTimeout = err instanceof Error && err.name === 'AbortError';
-      res.status(isTimeout ? 504 : 502).json({
+      const status = isTimeout ? 504 : 502;
+      res.status(status).json({
         error: isTimeout
-          ? 'Waktu tunggu balasan webhook n8n habis. Mohon coba kirim ulang pesan Anda.'
-          : 'Gagal terhubung ke webhook n8n. Periksa kembali N8N_WEBHOOK_URL di konfigurasi server.',
+          ? `Waktu tunggu respons webhook n8n habis (HTTP ${status}).`
+          : `Tidak dapat menjangkau endpoint webhook n8n (HTTP ${status}). Periksa status aktif workflow n8n Anda.`,
+        httpStatus: status,
       });
     } finally {
       clearTimeout(timeoutId);

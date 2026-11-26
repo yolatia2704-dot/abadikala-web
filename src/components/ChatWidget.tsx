@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import {
+  Check,
   Loader2,
   MessageSquare,
   RotateCcw,
   Send,
+  Settings2,
   X,
 } from 'lucide-react';
 import type { OrderItem, ProductLineId } from '../data/catalog';
@@ -21,6 +23,10 @@ interface ChatWidgetProps {
   orderItems: OrderItem[];
 }
 
+const DEFAULT_WEBHOOK_URL =
+  'https://n8n-n8n.fei69c.easypanel.host/webhook/abadikala-chat';
+const STORAGE_KEY = 'abadikala_n8n_webhook_url';
+
 const QUICK_PROMPTS = [
   'Rekomendasi buket Lini Segar hari ini',
   'Bagaimana cara preservasi buket ke Shadow-Box?',
@@ -34,11 +40,6 @@ function getTimeLabel(): string {
   });
 }
 
-function createSessionId(): string {
-  const randomPart = Math.random().toString(36).slice(2, 10);
-  return `abk_${Date.now().toString(36)}_${randomPart}`;
-}
-
 function createInitialMessages(): ChatMessage[] {
   return [
     {
@@ -50,41 +51,43 @@ function createInitialMessages(): ChatMessage[] {
   ];
 }
 
-export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
+function loadInitialWebhookUrl(): string {
+  try {
+    const stored = window.localStorage.getItem(STORAGE_KEY)?.trim();
+    return stored || DEFAULT_WEBHOOK_URL;
+  } catch {
+    return DEFAULT_WEBHOOK_URL;
+  }
+}
+
+export function ChatWidget(_props: ChatWidgetProps) {
   const [isOpen, setIsOpen] = useState(false);
+  const [showWebhookPanel, setShowWebhookPanel] = useState(false);
+  const [webhookUrl, setWebhookUrl] = useState<string>(() =>
+    loadInitialWebhookUrl(),
+  );
+  const [webhookInput, setWebhookInput] = useState<string>(() =>
+    loadInitialWebhookUrl(),
+  );
+  const [webhookError, setWebhookError] = useState<string | null>(null);
+  const [webhookSavedNotice, setWebhookSavedNotice] = useState(false);
+
   const [messages, setMessages] = useState<ChatMessage[]>(() =>
     createInitialMessages(),
   );
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
-  const [n8nConnected, setN8nConnected] = useState<boolean | null>(null);
-  const sessionIdRef = useRef<string>(createSessionId());
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/chat/status')
-      .then((res) => (res.ok ? res.json() : { connected: false }))
-      .then((data: { connected?: boolean }) => {
-        if (!cancelled) {
-          setN8nConnected(Boolean(data.connected));
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setN8nConnected(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const isWebhookConfigured = webhookUrl.trim().length > 0;
 
   useEffect(() => {
-    if (isOpen) {
+    if (isOpen && !showWebhookPanel) {
       scrollAnchorRef.current?.scrollIntoView({ behavior: 'smooth' });
       inputRef.current?.focus();
     }
-  }, [isOpen, messages, isSending]);
+  }, [isOpen, showWebhookPanel, messages, isSending]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -95,9 +98,68 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen]);
 
+  const handleSaveWebhook = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const trimmed = webhookInput.trim();
+    setWebhookError(null);
+
+    if (!trimmed) {
+      setWebhookError('URL webhook tidak boleh kosong.');
+      return;
+    }
+
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== 'https:') {
+        setWebhookError('Gunakan URL webhook n8n berawalan https://.');
+        return;
+      }
+      if (!/\/webhook(-test)?(\/|$)/i.test(parsed.pathname)) {
+        setWebhookError(
+          'Pastikan tautan mengandung jalur /webhook/ atau /webhook-test/ dari n8n.',
+        );
+        return;
+      }
+    } catch {
+      setWebhookError('Format URL belum valid.');
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(STORAGE_KEY, trimmed);
+    } catch {
+      // Ignore storage restrictions
+    }
+    setWebhookUrl(trimmed);
+    setWebhookSavedNotice(true);
+    window.setTimeout(() => {
+      setWebhookSavedNotice(false);
+      setShowWebhookPanel(false);
+    }, 900);
+  };
+
+  const handleRestoreDefaultWebhook = () => {
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Ignore storage restrictions
+    }
+    setWebhookUrl(DEFAULT_WEBHOOK_URL);
+    setWebhookInput(DEFAULT_WEBHOOK_URL);
+    setWebhookError(null);
+  };
+
   const sendMessage = async (textToSend: string) => {
     const trimmed = textToSend.trim();
     if (!trimmed || isSending) return;
+
+    const history = messages
+      .filter((m) => !m.isError)
+      .slice(-4)
+      .map((m) => ({
+        role: m.role,
+        content: m.text,
+      }));
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -116,26 +178,28 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: trimmed,
-          sessionId: sessionIdRef.current,
-          context: {
-            activeLine,
-            cartItemCount: orderItems.reduce((sum, i) => sum + i.quantity, 0),
-            cartSummary: orderItems.map((i) => `${i.name} (${i.quantity}x)`),
-          },
+          history,
+          webhookUrl: webhookUrl.trim(),
         }),
       });
 
-      const data = (await response.json()) as {
+      const rawResponseText = await response.text();
+      let data: {
         reply?: string;
+        output?: string;
+        message?: string;
         error?: string;
-        connected?: boolean;
-      };
+        httpStatus?: number;
+      } = {};
 
-      if (typeof data.connected === 'boolean') {
-        setN8nConnected(data.connected);
+      try {
+        data = JSON.parse(rawResponseText) as typeof data;
+      } catch {
+        data = {};
       }
 
       if (!response.ok) {
+        const statusCode = data.httpStatus ?? response.status;
         setMessages((prev) => [
           ...prev,
           {
@@ -143,7 +207,22 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
             role: 'assistant',
             text:
               data.error ||
-              'Maaf, terjadi kendala saat menghubungi asisten studio. Anda juga dapat langsung memesan melalui tombol WhatsApp.',
+              `Gagal menghubungi webhook n8n (HTTP ${statusCode}). Periksa URL webhook atau pastikan workflow n8n aktif.`,
+            time: getTimeLabel(),
+            isError: true,
+          },
+        ]);
+        return;
+      }
+
+      const botReply = data.reply || data.output || data.message;
+      if (!botReply) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: 'assistant',
+            text: `Respons webhook n8n tidak berisi teks balasan (HTTP ${response.status}). Pastikan node Respond to Webhook mengembalikan field reply, output, atau message.`,
             time: getTimeLabel(),
             isError: true,
           },
@@ -156,19 +235,19 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
         {
           id: `bot-${Date.now()}`,
           role: 'assistant',
-          text:
-            data.reply ||
-            'Pesan Anda sudah diterima oleh studio Abadikala.',
+          text: botReply,
           time: getTimeLabel(),
         },
       ]);
-    } catch {
+    } catch (err) {
+      const detail =
+        err instanceof Error && err.message ? ` (${err.message})` : '';
       setMessages((prev) => [
         ...prev,
         {
           id: `err-${Date.now()}`,
           role: 'assistant',
-          text: 'Koneksi ke server sedang terganggu. Silakan coba kirim ulang pesan Anda beberapa saat lagi.',
+          text: `Koneksi ke endpoint obrolan gagal (HTTP 0 / Network Error)${detail}. Silakan periksa jaringan Anda dan coba kembali.`,
           time: getTimeLabel(),
           isError: true,
         },
@@ -184,7 +263,6 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
   };
 
   const handleResetChat = () => {
-    sessionIdRef.current = createSessionId();
     setMessages(createInitialMessages());
     setInput('');
   };
@@ -196,22 +274,43 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
         <section
           role="dialog"
           aria-label="Asisten Studio Abadikala"
-          className="fixed bottom-20 right-4 sm:right-6 z-50 w-[calc(100vw-2rem)] sm:w-[390px] max-h-[min(560px,74vh)] bg-[#F7F3EE] border border-[#DCD3C9] rounded flex flex-col overflow-hidden"
+          className="fixed bottom-20 right-4 sm:right-6 z-50 w-[calc(100vw-2rem)] sm:w-[390px] max-h-[min(580px,76vh)] bg-[#F7F3EE] border border-[#DCD3C9] rounded flex flex-col overflow-hidden"
         >
           {/* Editorial Header */}
           <div className="px-4 py-3.5 bg-[#EFE9E0] border-b border-[#DCD3C9] flex items-center justify-between gap-3">
-            <div>
-              <h2 className="font-editorial text-xl font-semibold text-[#2B2625] leading-tight">
+            <div className="min-w-0">
+              <h2 className="font-editorial text-xl font-semibold text-[#2B2625] leading-tight truncate">
                 Asisten Studio Abadikala
               </h2>
-              <p className="text-[11px] text-[#6E655F] mt-0.5">
-                {n8nConnected
-                  ? 'Terhubung via webhook n8n · Lhokseumawe'
-                  : 'Pratinjau lokal · Siap hubungkan webhook n8n'}
+              <p
+                className={`text-[11px] font-medium mt-0.5 truncate ${
+                  isWebhookConfigured ? 'text-[#4B6345]' : 'text-[#6E655F]'
+                }`}
+              >
+                {isWebhookConfigured
+                  ? 'Terhubung • Studio Abadikala'
+                  : 'URL Webhook belum diatur'}
               </p>
             </div>
 
             <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setWebhookInput(webhookUrl);
+                  setWebhookError(null);
+                  setShowWebhookPanel((prev) => !prev);
+                }}
+                aria-label="Pengaturan URL Webhook n8n"
+                title="Pengaturan URL Webhook n8n"
+                className={`p-2 rounded transition-colors cursor-pointer ${
+                  showWebhookPanel
+                    ? 'text-[#6D3B47] bg-[#F7F3EE]'
+                    : 'text-[#6E655F] hover:text-[#2B2625]'
+                }`}
+              >
+                <Settings2 className="w-4 h-4 stroke-[1.5]" />
+              </button>
               <button
                 type="button"
                 onClick={handleResetChat}
@@ -232,6 +331,70 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
             </div>
           </div>
 
+          {/* Manual Webhook URL Settings Panel */}
+          {showWebhookPanel && (
+            <form
+              onSubmit={handleSaveWebhook}
+              className="p-4 bg-[#EFE9E0]/65 border-b border-[#DCD3C9] space-y-2.5"
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <label
+                  htmlFor="n8n-webhook-url-input"
+                  className="text-xs font-medium text-[#2B2625]"
+                >
+                  URL Webhook n8n (POST)
+                </label>
+                {webhookUrl !== DEFAULT_WEBHOOK_URL && (
+                  <button
+                    type="button"
+                    onClick={handleRestoreDefaultWebhook}
+                    className="text-[11px] text-[#6E655F] underline underline-offset-2 hover:text-[#6D3B47] cursor-pointer"
+                  >
+                    Kembalikan default
+                  </button>
+                )}
+              </div>
+
+              <input
+                id="n8n-webhook-url-input"
+                type="url"
+                value={webhookInput}
+                onChange={(e) => {
+                  setWebhookInput(e.target.value);
+                  setWebhookError(null);
+                }}
+                placeholder={DEFAULT_WEBHOOK_URL}
+                className="w-full px-3 py-2 text-xs bg-[#F7F3EE] border border-[#DCD3C9] rounded text-[#2B2625] placeholder:text-[#6E655F]/70 focus:border-[#6D3B47] focus:outline-none"
+              />
+
+              {webhookError && (
+                <p className="text-[11px] text-[#6D3B47] leading-snug">
+                  {webhookError}
+                </p>
+              )}
+
+              <div className="flex items-center justify-between gap-2 pt-1">
+                <p className="text-[10px] text-[#6E655F] leading-snug">
+                  Payload: <code className="text-[#2B2625]">message</code> &amp;{' '}
+                  <code className="text-[#2B2625]">history</code> (4 pesan terakhir).
+                </p>
+                <button
+                  type="submit"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-[#6D3B47] text-[#F7F3EE] text-xs font-medium rounded hover:bg-[#572D37] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {webhookSavedNotice ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 stroke-[2]" aria-hidden="true" />
+                      <span>Tersimpan</span>
+                    </>
+                  ) : (
+                    <span>Simpan URL</span>
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
+
           {/* Messages Thread */}
           <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3.5">
             {messages.map((msg) => {
@@ -246,7 +409,7 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
                       isUser
                         ? 'bg-[#6D3B47] text-[#F7F3EE]'
                         : msg.isError
-                          ? 'bg-[#EFE9E0] border border-[#6D3B47]/45 text-[#2B2625]'
+                          ? 'bg-[#EFE9E0] border border-[#6D3B47]/55 text-[#2B2625]'
                           : 'bg-[#EFE9E0] border border-[#DCD3C9] text-[#2B2625]'
                     }`}
                   >
@@ -266,7 +429,7 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
                     className="w-3.5 h-3.5 stroke-[1.5] animate-spin text-[#6D3B47]"
                     aria-hidden="true"
                   />
-                  <span>Menghubungi studio...</span>
+                  <span>Menghubungi Studio Abadikala...</span>
                 </div>
               </div>
             )}
@@ -320,13 +483,6 @@ export function ChatWidget({ activeLine, orderItems }: ChatWidgetProps) {
                 <Send className="w-4 h-4 stroke-[1.5]" />
               </button>
             </div>
-
-            {n8nConnected === false && (
-              <p className="mt-2 text-[10px] text-[#6E655F] leading-snug">
-                Tambahkan <code className="text-[#2B2625]">N8N_WEBHOOK_URL</code> di
-                pengaturan Secrets agar obrolan diteruskan langsung ke workflow n8n Anda.
-              </p>
-            )}
           </form>
         </section>
       )}
